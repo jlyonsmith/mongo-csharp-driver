@@ -123,12 +123,12 @@ namespace MongoDB.Bson.Serialization.Serializers
             {
                 switch (dateTimeSerializationOptions.Kind)
                 {
-                    case DateTimeKind.Unspecified:
                     case DateTimeKind.Local:
+                    case DateTimeKind.Unspecified:
                         value = DateTime.SpecifyKind(BsonUtils.ToLocalTime(value), dateTimeSerializationOptions.Kind);
                         break;
                     case DateTimeKind.Utc:
-                        value = DateTime.SpecifyKind(value, DateTimeKind.Utc);
+                        value = BsonUtils.ToUniversalTime(value);
                         break;
                 }
             }
@@ -163,16 +163,7 @@ namespace MongoDB.Bson.Serialization.Serializers
             }
             else
             {
-                switch (dateTimeSerializationOptions.Kind)
-                {
-                    case DateTimeKind.Unspecified:
-                    case DateTimeKind.Local:
-                        utcDateTime = BsonUtils.ToUniversalTime(dateTime);
-                        break;
-                    case DateTimeKind.Utc:
-                        utcDateTime = DateTime.SpecifyKind(dateTime, DateTimeKind.Utc);
-                        break;
-                }
+                utcDateTime = BsonUtils.ToUniversalTime(dateTime);
             }
             var millisecondsSinceEpoch = BsonUtils.ToMillisecondsSinceEpoch(utcDateTime);
 
