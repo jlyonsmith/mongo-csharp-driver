@@ -115,21 +115,13 @@ namespace MongoDB.Driver
         /// Runs an aggregation framework command.
         /// </summary>
         /// <param name="operations">The pipeline operations.</param>
-        /// <returns>An AggregateResult.</returns>
+        /// <returns>
+        /// An AggregateResult.
+        /// </returns>
         public virtual AggregateResult Aggregate(IEnumerable<BsonDocument> operations)
         {
-            var pipeline = new BsonArray();
-            foreach (var operation in operations)
-            {
-                pipeline.Add(operation);
-            }
-
-            var aggregateCommand = new CommandDocument
-            {
-                { "aggregate", _name },
-                { "pipeline", pipeline }
-            };
-            return RunCommandAs<AggregateResult>(aggregateCommand);
+            var options = new MongoAggregateOptions { OutputMode = AggregateOutputMode.Inline };
+            return RunAggregateCommand(operations, options);
         }
 
         /// <summary>
@@ -139,7 +131,54 @@ namespace MongoDB.Driver
         /// <returns>An AggregateResult.</returns>
         public virtual AggregateResult Aggregate(params BsonDocument[] operations)
         {
-            return Aggregate((IEnumerable<BsonDocument>) operations);
+            return Aggregate((IEnumerable<BsonDocument>)operations);
+        }
+
+        /// <summary>
+        /// Represents an aggregate query. The command is not sent to the server until the result is enumerated.
+        /// </summary>
+        /// <param name="operations">The operations.</param>
+        /// <returns>A sequence of documents.</returns>
+        public virtual IEnumerable<BsonDocument> AggregateQuery(IEnumerable<BsonDocument> operations)
+        {
+            var options = new MongoAggregateOptions { OutputMode = AggregateOutputMode.Inline };
+            return AggregateQuery(operations, options);
+        }
+
+        /// <summary>
+        /// Represents an aggregate query. The command is not sent to the server until the result is enumerated.
+        /// </summary>
+        /// <param name="operations">The operations.</param>
+        /// <param name="options">The options.</param>
+        /// <returns>A sequence of documents.</returns>
+        public virtual IEnumerable<BsonDocument> AggregateQuery(IEnumerable<BsonDocument> operations, MongoAggregateOptions options)
+        {
+            var operationsList = operations.ToList();
+            var lastOperation = operationsList.LastOrDefault();
+
+            var executeImmediately = false;
+            if (lastOperation != null && lastOperation.GetElement(0).Name == "$out")
+            {
+                executeImmediately = true;
+            }
+
+            AggregateResult immediateExecutionResult = null;
+            if (executeImmediately)
+            {
+                immediateExecutionResult = RunAggregateCommand(operationsList, options);
+            }
+
+            return new AggregateQueryResult(this, operationsList, options, immediateExecutionResult);
+        }
+
+        /// <summary>
+        /// Represents an aggregate query. The command is not sent to the server until the result is enumerated.
+        /// </summary>
+        /// <param name="operations">The operations.</param>
+        /// <returns>A sequence of documents.</returns>
+        public virtual IEnumerable<BsonDocument> AggregateQuery(params BsonDocument[] operations)
+        {
+            return AggregateQuery((IEnumerable<BsonDocument>)operations);
         }
 
         /// <summary>
@@ -1139,7 +1178,8 @@ namespace MongoDB.Driver
                 options.CheckElementNames,
                 nominalType,
                 documents,
-                options.Flags);
+                options.Flags,
+                this);
 
             var connection = _server.AcquireConnection(ReadPreference.Primary);
             try
@@ -1392,71 +1432,65 @@ namespace MongoDB.Driver
         /// <returns>A WriteConcernResult (or null if WriteConcern is disabled).</returns>
         public virtual WriteConcernResult Save(Type nominalType, object document, MongoInsertOptions options)
         {
+            if (nominalType == null)
+            {
+                throw new ArgumentNullException("nominalType");
+            }
             if (document == null)
             {
                 throw new ArgumentNullException("document");
             }
+
             var serializer = BsonSerializer.LookupSerializer(document.GetType());
+
+            // if we can determine for sure that it is a new document and we can generate an Id for it then insert it
             var idProvider = serializer as IBsonIdProvider;
-            object id;
-            Type idNominalType;
-            IIdGenerator idGenerator;
-            if (idProvider != null && idProvider.GetDocumentId(document, out id, out idNominalType, out idGenerator))
+            if (idProvider != null)
             {
-                if (id == null && idGenerator == null)
+                object id;
+                Type idNominalType;
+                IIdGenerator idGenerator;
+                var hasId = idProvider.GetDocumentId(document, out id, out idNominalType, out idGenerator);
+
+                if (idGenerator == null && (!hasId || id == null))
                 {
                     throw new InvalidOperationException("No IdGenerator found.");
                 }
 
-                if (idGenerator != null && idGenerator.IsEmpty(id))
+                if (idGenerator != null && (!hasId || idGenerator.IsEmpty(id)))
                 {
                     id = idGenerator.GenerateId(this, document);
                     idProvider.SetDocumentId(document, id);
                     return Insert(nominalType, document, options);
                 }
-                else
-                {
-                    BsonValue idBsonValue;
-                    var documentType = document.GetType();
-                    if (BsonClassMap.IsClassMapRegistered(documentType))
-                    {
-                        var classMap = BsonClassMap.LookupClassMap(documentType);
-                        var idMemberMap = classMap.IdMemberMap;
-                        var idSerializer = idMemberMap.GetSerializer(id.GetType());
-                        // we only care about the serialized _id value but we need a dummy document to serialize it into
-                        var bsonDocument = new BsonDocument();
-                        var bsonDocumentWriterSettings = new BsonDocumentWriterSettings
-                        {
-                            GuidRepresentation = _settings.GuidRepresentation
-                        };
-                        var bsonWriter = new BsonDocumentWriter(bsonDocument, bsonDocumentWriterSettings);
-                        bsonWriter.WriteStartDocument();
-                        bsonWriter.WriteName("_id");
-                        idSerializer.Serialize(bsonWriter, id.GetType(), id, idMemberMap.SerializationOptions);
-                        bsonWriter.WriteEndDocument();
-                        idBsonValue = bsonDocument[0]; // extract the _id value from the dummy document
-                    } else {
-                        if (!BsonTypeMapper.TryMapToBsonValue(id, out idBsonValue))
-                        {
-                            idBsonValue = BsonDocumentWrapper.Create(idNominalType, id);
-                        }
-                    }
-
-                    var query = Query.EQ("_id", idBsonValue);
-                    var update = Builders.Update.Replace(nominalType, document);
-                    var updateOptions = new MongoUpdateOptions
-                    {
-                        CheckElementNames = options.CheckElementNames,
-                        Flags = UpdateFlags.Upsert,
-                        WriteConcern = options.WriteConcern
-                    };
-                    return Update(query, update, updateOptions);
-                }
             }
-            else
+
+            // since we can't determine for sure whether it's a new document or not upsert it
+            // the only safe way to get the serialized _id value needed for the query is to serialize the entire document
+
+            var bsonDocument = new BsonDocument();
+            var writerSettings = new BsonDocumentWriterSettings { GuidRepresentation = _settings.GuidRepresentation };
+            using (var bsonWriter = new BsonDocumentWriter(bsonDocument, writerSettings))
+            {
+                serializer.Serialize(bsonWriter, nominalType, document, null);
+            }
+
+            BsonValue idBsonValue;
+            if (!bsonDocument.TryGetValue("_id", out idBsonValue))
             {
                 throw new InvalidOperationException("Save can only be used with documents that have an Id.");
             }
+
+            var query = Query.EQ("_id", idBsonValue);
+            var update = Builders.Update.Replace(bsonDocument);
+            var updateOptions = new MongoUpdateOptions
+            {
+                CheckElementNames = options.CheckElementNames,
+                Flags = UpdateFlags.Upsert,
+                WriteConcern = options.WriteConcern
+            };
+
+            return Update(query, update, updateOptions);
         }
 
         /// <summary>
@@ -1630,6 +1664,38 @@ namespace MongoDB.Driver
                 GuidRepresentation = _settings.GuidRepresentation,
                 MaxDocumentSize = connection.ServerInstance.MaxDocumentSize
             };
+        }
+
+        internal AggregateResult RunAggregateCommand(IEnumerable<BsonDocument> operations, MongoAggregateOptions options)
+        {
+            var pipeline = new BsonArray();
+            foreach (var operation in operations)
+            {
+                pipeline.Add(operation);
+            }
+
+            var aggregateCommand = new CommandDocument
+            {
+                { "aggregate", _name },
+                { "pipeline", pipeline }
+            };
+            if (options.OutputMode == AggregateOutputMode.Cursor)
+            {
+                if (options.BatchSize == null)
+                {
+                    aggregateCommand["cursor"] = new BsonDocument();
+                }
+                else
+                {
+                    aggregateCommand["cursor"] = new BsonDocument("batchSize", options.BatchSize.Value);
+                }
+            }
+            if (options.AllowDiskUsage)
+            {
+                aggregateCommand["allowDiskUsage"] = true;
+            }
+
+            return RunCommandAs<AggregateResult>(aggregateCommand);
         }
 
         // private methods
